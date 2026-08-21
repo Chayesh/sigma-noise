@@ -1,0 +1,7 @@
+# Normalize line endings so this doesn't turn into a CRLF/LF diff mess
+# between your Windows dev machine and anyone cloning on Linux/Mac.
+* text=auto eol=lf
+
+# Binary files -- don't let git try to diff/convert these
+*.evtx binary
+*.json text eol=lf

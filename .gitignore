@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large / regeneratable sample data -- see README "Downloading sample data"
+# for how to re-fetch these. Keeping the repo light and avoiding committing
+# large binary EVTX files that don't diff meaningfully in git anyway.
+data/logs/*.evtx
+data/baseline/win7-x86/
+data/baseline/*.tgz
+
+# Keep the small cached baseline JSON and rule files though
+!data/baseline/sysmon_baseline_sample.json
+!data/rules/*.yml
+
+# Local debug scripts / scratch files
+debug_*.py
+*.local.py
+
+# Credentials -- never commit real SIEM creds if you script them into a file
+.env
+*.secrets
