@@ -1,6 +1,6 @@
 # sigma-noise
 
-[![CI](https://github.com/Chayesh/sigma-noise/actions/workflows/ci.yml/badge.svg)](https://github.com/Chayesh/sigma-noise/actions/workflows/ci.yml)
+[![CI](https://github.com/YOUR-USERNAME/sigma-noise/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR-USERNAME/sigma-noise/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -72,19 +72,61 @@ python -m src.cli --rule data/rules/test_accessibility_tools.yml \
 ## Usage
 
 ```
-python -m src.cli --rule RULE.yml [--logs PATH...] [--baseline PATH...]
+python -m src.cli (--rule RULE.yml | --rules-dir DIR) [--logs PATH...] [--baseline PATH...]
                    [--source {local,mock,wazuh,sentinel,splunk}]
                    [--lookback-hours N] [--json]
 ```
 
 | Flag | Meaning |
 |---|---|
-| `--rule` | Path to a Sigma rule YAML file (required) |
+| `--rule` | Path to a single Sigma rule YAML file. Mutually exclusive with `--rules-dir`. |
+| `--rules-dir` | Directory of Sigma rule YAML files — batch-scores the whole ruleset against the same data and ranks worst-to-best. See [Batch mode](#batch-mode-ruleset-triage) below. |
 | `--logs` | `.evtx`/`.json` file(s) or a directory of them. Required when `--source local` (the default). |
 | `--baseline` | Same, but for **known-benign** traffic. Any match here is treated as real FP evidence and dominates the score. |
 | `--source` | Where events come from: `local` (default), `mock`, `wazuh`, `sentinel`, `splunk` |
 | `--lookback-hours` | For live sources, how far back to pull (default 24) |
 | `--json` | Machine-readable output instead of the formatted report |
+
+### Batch mode: ruleset triage
+
+A real SOC doesn't tune Sigma rules one at a time — they inherit hundreds
+from SigmaHQ and need to know which ones are landmines *before* enabling
+any of them. `--rules-dir` runs every `.yml`/`.yaml` rule in a folder
+against the same log/baseline data and prints a single ranked table,
+worst offenders first:
+
+```bash
+python -m src.cli --rules-dir data/rules/batch_test \
+    --logs data/logs/persistence_shim_appfix.evtx \
+    --baseline data/baseline/sysmon_baseline_sample.json
+```
+
+```
+====================================================================================================
+RULESET NOISE TRIAGE  —  5 rule(s) scored
+====================================================================================================
+
+     SCORE    MATCHES    BASELINE  RULE
+---------------------------------------
+🟡    0.448         48   155/6000!  Accessibility Tool Execution (osk/LogonUI/utilman family)
+🟢    0.036          1      0/6000  Whoami.EXE Execution Anomaly
+🟢    0.000          0      0/6000  PowerShell Download and Execution Cradles
+🟢    0.000          0      0/6000  Process Execution From A Potentially Suspicious Folder
+🟢    0.000          0      0/6000  Suspicious New Service Creation
+
+  🔴 0 red   🟡 1 yellow   🟢 4 green
+
+  Worst offenders (deploy these last, or not without tuning):
+    - Accessibility Tool Execution (osk/LogonUI/utilman family)
+        This rule matched confirmed-benign traffic in the baseline set -- do not
+        deploy without narrowing the selection before going live
+```
+
+Rules that fail to parse or evaluate (e.g. use a Sigma modifier this
+evaluator doesn't support yet) are skipped with a reason shown at the end,
+rather than crashing the whole batch — verified by deliberately feeding it
+a rule with an unsupported modifier alongside 4 real SigmaHQ rules; the
+batch completed and flagged the one bad rule by name and error.
 
 ### Live SIEM connectors
 
@@ -129,6 +171,18 @@ inferred — everything is a real, reproduced result.
 - **Real SigmaHQ rule** (`susp_execution_path.yml`) run as a negative
   control against the same data: **0 matches, green tier** — confirms the
   tool doesn't just flag everything.
+
+### Batch mode (ruleset triage)
+Ran `--rules-dir` against 5 real rules (the noisy test rule + 4 unmodified
+SigmaHQ rules covering whoami anomalies, PowerShell download cradles,
+suspicious execution paths, and suspicious service creation) with the
+baseline attached:
+- Correctly ranked the noisy test rule **first** (yellow, 48 matches, flagged
+  against the baseline) and all 4 real SigmaHQ rules green underneath it
+- Separately verified error handling: deliberately added a rule using an
+  unsupported Sigma modifier to the batch — it was skipped with its
+  filename and exact error shown at the end of the report, and the other
+  5 rules still scored correctly. One bad rule doesn't take down the batch.
 
 ### Baseline false-positive checking
 - Pulled a real goodware baseline from
@@ -238,7 +292,7 @@ src/
   evtx_parser.py       -- EVTX -> normalized dict, + JSON cache load/save
   sigma_eval.py         -- pySigma AST walker + matcher (all modifiers)
   noise_score.py         -- scoring engine (volume/entity/temporal/noisy-pattern/baseline)
-  cli.py                 -- entry point, --source dispatch
+  cli.py                 -- entry point, --rule / --rules-dir / --source dispatch
   connectors/
     base.py               -- SIEMConnector abstract interface
     mock.py                 -- synthetic data connector (tested, works end to end)
@@ -248,6 +302,7 @@ src/
 data/
   logs/                 -- sample EVTX (sbousseaden/EVTX-ATTACK-SAMPLES; re-download, see above)
   rules/                 -- test rule + real SigmaHQ rules
+  rules/batch_test/       -- 5-rule set used to validate --rules-dir batch mode
   baseline/                -- goodware baseline sample (NextronSystems/evtx-baseline)
 ```
 
@@ -255,6 +310,7 @@ data/
 
 ## Roadmap
 
+- [x] Batch mode (`--rules-dir`) — score an entire ruleset, ranked worst-to-best
 - [ ] Live-test the Wazuh and Sentinel connectors against real instances
 - [ ] Larger/incremental baseline dataset (full 124MB NextronSystems set)
 - [ ] Validate `re`/`cidr`/`base64offset` against a real SigmaHQ rule

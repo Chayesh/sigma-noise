@@ -37,6 +37,14 @@ def collect_log_files(logs_arg: list[str]) -> list[str]:
     return files
 
 
+def collect_rule_files(path: str) -> list[str]:
+    if os.path.isdir(path):
+        return sorted(glob.glob(os.path.join(path, "*.yml")) + glob.glob(os.path.join(path, "*.yaml")))
+    if os.path.isfile(path):
+        return [path]
+    return []
+
+
 def print_report(report, verbose: bool = True):
     icon = TIER_ICON.get(report.tier, "")
     print()
@@ -65,9 +73,57 @@ def print_report(report, verbose: bool = True):
     print()
 
 
+def print_batch_summary(results: list[dict], load_errors: list[tuple]):
+    """results: list of {'rule_file': str, 'report': NoiseReport}
+    load_errors: list of (rule_file, error_message) for rules that failed to parse/run."""
+    tier_order = {"red": 0, "yellow": 1, "green": 2}
+    ranked = sorted(results, key=lambda r: (tier_order.get(r["report"].tier, 3), -r["report"].composite_score))
+
+    print()
+    print(f"{'='*100}")
+    print(f"RULESET NOISE TRIAGE  —  {len(results)} rule(s) scored" + (f", {len(load_errors)} skipped" if load_errors else ""))
+    print(f"{'='*100}")
+    print()
+    header = f"{'':3} {'SCORE':>6}  {'MATCHES':>9}  {'BASELINE':>10}  RULE"
+    print(header)
+    print("-" * len(header))
+    for r in ranked:
+        rep = r["report"]
+        icon = TIER_ICON.get(rep.tier, "")
+        baseline_col = "-"
+        if rep.baseline_used:
+            baseline_col = f"{rep.baseline_matches}/{rep.baseline_total_events}"
+            if rep.baseline_matches:
+                baseline_col += "!"
+        title = rep.rule_title[:60]
+        print(f"{icon}   {rep.composite_score:>6.3f}  {rep.total_matches:>9}  {baseline_col:>10}  {title}")
+
+    red = [r for r in ranked if r["report"].tier == "red"]
+    yellow = [r for r in ranked if r["report"].tier == "yellow"]
+    green = [r for r in ranked if r["report"].tier == "green"]
+    print()
+    print(f"  🔴 {len(red)} red   🟡 {len(yellow)} yellow   🟢 {len(green)} green")
+    if load_errors:
+        print(f"\n  Skipped {len(load_errors)} rule(s) that failed to load/evaluate:")
+        for f, err in load_errors:
+            print(f"    - {os.path.basename(f)}: {err}")
+
+    if red or yellow:
+        print(f"\n  Worst offenders (deploy these last, or not without tuning):")
+        for r in (red + yellow)[:5]:
+            rep = r["report"]
+            reason = rep.suggested_exclusions[0] if rep.suggested_exclusions else rep.tier_reason
+            print(f"    - {rep.rule_title[:70]}")
+            print(f"        {reason}")
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Backtest a Sigma rule against sample logs and estimate FP noise.")
-    parser.add_argument("--rule", required=True, help="Path to a Sigma rule YAML file")
+    parser.add_argument("--rule", help="Path to a single Sigma rule YAML file")
+    parser.add_argument("--rules-dir", help="Directory of Sigma rule YAML files to batch-score against the same log/baseline data "
+                                             "-- ranks the whole ruleset worst-to-best instead of checking one rule at a time. "
+                                             "Mutually exclusive with --rule.")
     parser.add_argument("--source", choices=["local", "mock", "wazuh", "sentinel", "splunk"], default="local",
                          help="Where to pull events from. 'local' reads --logs files (default). "
                               "'mock' generates synthetic data to test the pipeline. "
@@ -97,6 +153,13 @@ def main():
     splunk_group.add_argument("--splunk-filter", default="", help="Extra SPL appended after the index clause, e.g. 'sourcetype=WinEventLog:Sysmon/Operational'")
 
     args = parser.parse_args()
+
+    if not args.rule and not args.rules_dir:
+        print("Either --rule (single rule) or --rules-dir (batch mode) is required", file=sys.stderr)
+        sys.exit(1)
+    if args.rule and args.rules_dir:
+        print("--rule and --rules-dir are mutually exclusive -- pick one", file=sys.stderr)
+        sys.exit(1)
 
     if args.source == "local":
         if not args.logs:
@@ -154,20 +217,58 @@ def main():
         for f in baseline_files:
             baseline_events.extend(load_events(f))
 
-    rule = load_rule(args.rule)
-    matches = run_rule_against_events(rule, all_events)
-    baseline_matches = run_rule_against_events(rule, baseline_events) if baseline_events else []
-    report = compute_noise_score(
-        rule.title, all_events, matches,
-        baseline_total_events=len(baseline_events),
-        baseline_matched_events=baseline_matches,
-    )
-
-    if args.json:
-        print(json.dumps(report.__dict__, indent=2))
+    if args.rule:
+        # --- single-rule mode (original behavior) ---
+        rule = load_rule(args.rule)
+        matches = run_rule_against_events(rule, all_events)
+        baseline_matches = run_rule_against_events(rule, baseline_events) if baseline_events else []
+        report = compute_noise_score(
+            rule.title, all_events, matches,
+            baseline_total_events=len(baseline_events),
+            baseline_matched_events=baseline_matches,
+        )
+        if args.json:
+            print(json.dumps(report.__dict__, indent=2))
+        else:
+            print(f"Scanned {len(all_events)} events from {source_desc}")
+            print_report(report)
     else:
-        print(f"Scanned {len(all_events)} events from {source_desc}")
-        print_report(report)
+        # --- batch mode: score every rule in --rules-dir against the same data ---
+        rule_files = collect_rule_files(args.rules_dir)
+        if not rule_files:
+            print(f"No .yml/.yaml rule files found in {args.rules_dir}", file=sys.stderr)
+            sys.exit(1)
+
+        results = []
+        load_errors = []
+        for rf in rule_files:
+            try:
+                rule = load_rule(rf)
+                matches = run_rule_against_events(rule, all_events)
+                baseline_matches = run_rule_against_events(rule, baseline_events) if baseline_events else []
+                report = compute_noise_score(
+                    rule.title, all_events, matches,
+                    baseline_total_events=len(baseline_events),
+                    baseline_matched_events=baseline_matches,
+                )
+                results.append({"rule_file": rf, "report": report})
+            except Exception as e:
+                # A ruleset pulled from SigmaHQ or elsewhere will inevitably include
+                # some rules using features this evaluator doesn't support yet (see
+                # README limitations) -- skip and report them rather than crashing
+                # the whole batch over one unsupported rule.
+                load_errors.append((rf, str(e)))
+
+        if args.json:
+            print(json.dumps({
+                "scanned_events": len(all_events),
+                "source": source_desc,
+                "results": [{"rule_file": r["rule_file"], **r["report"].__dict__} for r in results],
+                "load_errors": [{"rule_file": f, "error": e} for f, e in load_errors],
+            }, indent=2))
+        else:
+            print(f"Scanned {len(all_events)} events from {source_desc}")
+            print_batch_summary(results, load_errors)
 
 
 if __name__ == "__main__":

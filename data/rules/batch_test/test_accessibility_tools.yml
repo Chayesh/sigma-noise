@@ -1,0 +1,31 @@
+title: Accessibility Tool Execution (osk/LogonUI/utilman family)
+id: 7c3f9a2e-1234-4abc-9def-000000000001
+status: test
+description: >
+  Detects execution of built-in Windows accessibility/login-screen binaries
+  that are commonly abused for sticky-keys-style backdoor persistence
+  (T1546.008). Broad on purpose for this test -- meant to demonstrate a
+  noisy rule since these binaries also launch legitimately.
+references:
+    - https://attack.mitre.org/techniques/T1546/008/
+author: CK (test rule for noise-score tool)
+date: 2026-08-16
+tags:
+    - attack.persistence
+    - attack.privilege_escalation
+    - attack.t1546.008
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    selection:
+        Image|contains:
+            - 'osk.exe'
+            - 'LogonUI.exe'
+            - 'sethc.exe'
+            - 'utilman.exe'
+    condition: selection
+falsepositives:
+    - Legitimate accessibility feature usage by users who need it
+    - Login screen rendering (LogonUI.exe runs on every login)
+level: medium
