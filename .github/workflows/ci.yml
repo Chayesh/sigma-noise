@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install pysigma pysigma-backend-splunk pysigma-pipeline-sysmon python-evtx requests
+
+      - name: Import check (all modules, including connectors)
+        run: |
+          python -c "
+          from src.evtx_parser import parse_evtx, load_events
+          from src.sigma_eval import load_rule, run_rule_against_events
+          from src.noise_score import compute_noise_score
+          from src.connectors import MockConnector, WazuhConnector, SentinelConnector, SplunkConnector
+          print('all modules import cleanly')
+          "
+
+      - name: Download sample EVTX data (same source as README)
+        run: |
+          mkdir -p data/logs
+          curl -sL "https://raw.githubusercontent.com/sbousseaden/EVTX-ATTACK-SAMPLES/master/Persistence/persistence_sysmon_11_13_1_shime_appfix.evtx" -o data/logs/persistence_shim_appfix.evtx
+
+      - name: Run against synthetic mock data (no external creds needed)
+        run: |
+          python -m src.cli --rule data/rules/test_accessibility_tools.yml --source mock
+
+      - name: Run against real sample data + baseline goodware -- confirm FP detection works
+        run: |
+          python -m src.cli --rule data/rules/test_accessibility_tools.yml \
+            --logs data/logs/persistence_shim_appfix.evtx \
+            --baseline data/baseline/sysmon_baseline_sample.json
+
+      - name: Negative control -- real SigmaHQ rule should score green
+        run: |
+          python -m src.cli --rule data/rules/susp_execution_path.yml \
+            --logs data/logs/persistence_shim_appfix.evtx
