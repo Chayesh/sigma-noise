@@ -18,7 +18,7 @@ import json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.evtx_parser import parse_evtx, load_events
-from src.sigma_eval import load_rule, run_rule_against_events
+from src.sigma_eval import load_rule, run_rule_against_events, run_rule_against_events_detailed
 from src.noise_score import compute_noise_score
 
 TIER_ICON = {"green": "\U0001F7E2", "yellow": "\U0001F7E1", "red": "\U0001F534"}
@@ -60,6 +60,8 @@ def print_report(report, verbose: bool = True):
     if report.baseline_used:
         flag = "⚠️  MATCHED BENIGN TRAFFIC" if report.baseline_matches else "clean against baseline"
         print(f"    baseline check:     {report.baseline_matches}/{report.baseline_total_events} benign events matched ({report.baseline_match_rate:.2%})  [{flag}]")
+    if report.logsource_status:
+        print(f"    logsource filter:   {report.logsource_status}" + (f"  ({report.logsource_filtered_out} wrong-type events excluded)" if report.logsource_filtered_out else ""))
     if report.top_noisy_indicators:
         print(f"    noisy indicators:   {', '.join(report.top_noisy_indicators)}")
     if verbose and report.top_entities:
@@ -74,8 +76,6 @@ def print_report(report, verbose: bool = True):
 
 
 def print_batch_summary(results: list[dict], load_errors: list[tuple]):
-    """results: list of {'rule_file': str, 'report': NoiseReport}
-    load_errors: list of (rule_file, error_message) for rules that failed to parse/run."""
     tier_order = {"red": 0, "yellow": 1, "green": 2}
     ranked = sorted(results, key=lambda r: (tier_order.get(r["report"].tier, 3), -r["report"].composite_score))
 
@@ -218,14 +218,16 @@ def main():
             baseline_events.extend(load_events(f))
 
     if args.rule:
-        # --- single-rule mode (original behavior) ---
         rule = load_rule(args.rule)
-        matches = run_rule_against_events(rule, all_events)
+        detailed = run_rule_against_events_detailed(rule, all_events)
+        matches = detailed["matches"]
         baseline_matches = run_rule_against_events(rule, baseline_events) if baseline_events else []
         report = compute_noise_score(
             rule.title, all_events, matches,
             baseline_total_events=len(baseline_events),
             baseline_matched_events=baseline_matches,
+            logsource_status=detailed["logsource_status"],
+            logsource_filtered_out=detailed["logsource_filtered_out"],
         )
         if args.json:
             print(json.dumps(report.__dict__, indent=2))
@@ -233,7 +235,6 @@ def main():
             print(f"Scanned {len(all_events)} events from {source_desc}")
             print_report(report)
     else:
-        # --- batch mode: score every rule in --rules-dir against the same data ---
         rule_files = collect_rule_files(args.rules_dir)
         if not rule_files:
             print(f"No .yml/.yaml rule files found in {args.rules_dir}", file=sys.stderr)
@@ -244,19 +245,18 @@ def main():
         for rf in rule_files:
             try:
                 rule = load_rule(rf)
-                matches = run_rule_against_events(rule, all_events)
+                detailed = run_rule_against_events_detailed(rule, all_events)
+                matches = detailed["matches"]
                 baseline_matches = run_rule_against_events(rule, baseline_events) if baseline_events else []
                 report = compute_noise_score(
                     rule.title, all_events, matches,
                     baseline_total_events=len(baseline_events),
                     baseline_matched_events=baseline_matches,
+                    logsource_status=detailed["logsource_status"],
+                    logsource_filtered_out=detailed["logsource_filtered_out"],
                 )
                 results.append({"rule_file": rf, "report": report})
             except Exception as e:
-                # A ruleset pulled from SigmaHQ or elsewhere will inevitably include
-                # some rules using features this evaluator doesn't support yet (see
-                # README limitations) -- skip and report them rather than crashing
-                # the whole batch over one unsupported rule.
                 load_errors.append((rf, str(e)))
 
         if args.json:

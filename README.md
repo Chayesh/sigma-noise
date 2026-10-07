@@ -1,6 +1,6 @@
 # sigma-noise
 
-[![CI](https://github.com/YOUR-USERNAME/sigma-noise/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR-USERNAME/sigma-noise/actions/workflows/ci.yml)
+[![CI](https://github.com/Chayesh/sigma-noise/actions/workflows/ci.yml/badge.svg)](https://github.com/Chayesh/sigma-noise/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -8,6 +8,42 @@ A CLI tool that backtests a Sigma detection rule against log data — local
 sample files or a live SIEM — and estimates how noisy it'll be **before**
 you deploy it. Answers the question every analyst asks a week too late:
 *"how many false positives is this rule actually going to generate?"*
+
+---
+
+## ⚠️ Correction (v1.2) — please read if you've seen earlier numbers from this project
+
+Earlier versions of this README and the accompanying FYP report cited a
+headline result of **"155/6,000 (2.58%) baseline events matched"** as
+evidence that the test rule needed tuning. That number was **partly
+wrong**, and the correction is itself the most important thing this
+version adds.
+
+The matcher previously checked only whether an event's **field values**
+matched a rule's selection — it never checked whether the **event type**
+itself belonged to the rule's declared category. Sysmon logs the `Image`
+field (which process a value belongs to) on far more event types than
+process creation: it's also present on DLL/image loads (EventID 7),
+registry changes (12/13), and raw disk reads (9), among others. A
+`process_creation` rule checking `Image|contains: LogonUI.exe` was
+therefore matching every time `LogonUI.exe` loaded a DLL, touched the
+registry, or did anything else Sysmon logs with an `Image` field — not
+just when it actually executed.
+
+Re-checked directly: of the original 155 baseline "matches," **136 were
+EventID 7 (image load), 11 were registry events, 2 were raw-access reads,
+and only 2 were genuine EventID 1 process-creation events.** The true
+false-positive evidence for this rule against this baseline is **2/6,000
+(0.03%)**, not 155/6,000. The rule is real, and `LogonUI.exe` genuinely
+does execute at every login — the evidence just wasn't anywhere near as
+strong as originally reported.
+
+This is now fixed (see "Logsource filtering" below) and the numbers
+throughout this README and the "Validated results" section are the
+corrected ones. The earlier FYP report submission is not retroactively
+editable, so if you're reading this alongside that report: **this README
+is the current, correct source of truth; treat the 155/6,000 figure in
+the original report as superseded by this finding.**
 
 ---
 
@@ -25,24 +61,62 @@ what to tune, before it ever hits a production queue.
 ## How it works
 
 1. **Parse** the Sigma rule with [pySigma](https://github.com/SigmaHQ/pySigma)
-2. **Evaluate** it against events by walking pySigma's parsed condition AST
-   directly (`ConditionAND`/`OR`/`NOT`, field-match leaves) — a real
-   evaluator, not string matching against YAML
-3. **Score** the matches on four factors: match volume (normalized by time
+2. **Filter by logsource** — before any field is checked, an event is
+   rejected outright if its EventID doesn't belong to the rule's declared
+   `logsource.category` (see below). This runs first, not as an afterthought.
+3. **Evaluate** surviving events against the rule by walking pySigma's
+   parsed condition AST directly (`ConditionAND`/`OR`/`NOT`, field-match
+   leaves) — a real evaluator, not string matching against YAML
+4. **Score** the matches on four factors: match volume (normalized by time
    span), entity diversity, temporal clustering, and known-noisy-process
    flags — plus, if a benign baseline is supplied, real corroborated
    false-positive evidence, which dominates the score
-4. **Report** a tier (green/yellow/red), the composite score, and specific
-   tuning suggestions (e.g. "83% of matches are `svchost.exe` — exclude
-   this parent process")
+5. **Report** a tier (green/yellow/red), the composite score, and specific
+   tuning suggestions
 
 Event data can come from local `.evtx` files, a pre-parsed JSON cache, or a
 **live SIEM connector** (Splunk, Wazuh, Sentinel). Every source normalizes
 into the same flat event schema and feeds the same matcher and scorer —
-one evaluator, any backend. Connectors deliberately do **not** compile the
-Sigma rule into SPL/KQL/DSL; they pull raw events for the time window and
-let the same local matcher decide. One less compiler to build and
-maintain.
+one evaluator, any backend.
+
+---
+
+## Logsource filtering (new)
+
+`src/logsource_map.py` maps a rule's `logsource.category` (and, where
+specified, `service`) onto the Windows Event IDs that category can
+plausibly originate from — `process_creation` → `{1, 4688}`,
+`image_load` → `{7}`, `registry_event` → `{12, 13, 14}`, and so on for
+every Sysmon/Security category this project's data sources produce.
+Before an event ever reaches the field matcher, it's checked against this
+mapping; an event whose `EventID` doesn't belong to the rule's category is
+excluded, full stop, regardless of whether its field values would
+otherwise have matched.
+
+**This fails open, deliberately.** If a rule's `product` isn't `windows`,
+or its `category` isn't in the mapping table, nothing is filtered — the
+rule applies to every event, same as before this feature existed. Silent
+over-filtering (dropping events for a category we don't actually have
+mapping data for) would be worse than not filtering at all, because it
+would hide genuine matches with no visible sign it happened. Every report
+states explicitly whether the filter was applied or skipped, and why —
+see the `logsource filter:` line in the CLI output.
+
+### Why this matters, concretely
+
+Running the same test rule against the same real Sysmon capture:
+
+| | Before this fix | After this fix |
+|---|---|---|
+| Matches (local capture) | 48 | **36** |
+| Events excluded as wrong type | — | 62 (registry + file-create events where `Image` happened to match) |
+| Baseline matches (6,000 goodware events) | 155 (2.58%) | **2 (0.03%)** |
+| Resulting tier | Yellow | **Green** |
+
+The 12 extra local-capture matches were Sysmon FileCreate events
+(EventID 11) where `osk.exe` created a temp file — a `file_event`, not a
+`process_creation`, but the `Image` field was present either way. The
+baseline correction is detailed in the box above.
 
 ---
 
@@ -80,7 +154,7 @@ python -m src.cli (--rule RULE.yml | --rules-dir DIR) [--logs PATH...] [--baseli
 | Flag | Meaning |
 |---|---|
 | `--rule` | Path to a single Sigma rule YAML file. Mutually exclusive with `--rules-dir`. |
-| `--rules-dir` | Directory of Sigma rule YAML files — batch-scores the whole ruleset against the same data and ranks worst-to-best. See [Batch mode](#batch-mode-ruleset-triage) below. |
+| `--rules-dir` | Directory of Sigma rule YAML files — batch-scores the whole ruleset against the same data and ranks worst-to-best. |
 | `--logs` | `.evtx`/`.json` file(s) or a directory of them. Required when `--source local` (the default). |
 | `--baseline` | Same, but for **known-benign** traffic. Any match here is treated as real FP evidence and dominates the score. |
 | `--source` | Where events come from: `local` (default), `mock`, `wazuh`, `sentinel`, `splunk` |
@@ -88,12 +162,6 @@ python -m src.cli (--rule RULE.yml | --rules-dir DIR) [--logs PATH...] [--baseli
 | `--json` | Machine-readable output instead of the formatted report |
 
 ### Batch mode: ruleset triage
-
-A real SOC doesn't tune Sigma rules one at a time — they inherit hundreds
-from SigmaHQ and need to know which ones are landmines *before* enabling
-any of them. `--rules-dir` runs every `.yml`/`.yaml` rule in a folder
-against the same log/baseline data and prints a single ranked table,
-worst offenders first:
 
 ```bash
 python -m src.cli --rules-dir data/rules/batch_test \
@@ -108,25 +176,17 @@ RULESET NOISE TRIAGE  —  5 rule(s) scored
 
      SCORE    MATCHES    BASELINE  RULE
 ---------------------------------------
-🟡    0.448         48   155/6000!  Accessibility Tool Execution (osk/LogonUI/utilman family)
+🟢    0.201         36      2/6000!  Accessibility Tool Execution (osk/LogonUI/utilman family)
 🟢    0.036          1      0/6000  Whoami.EXE Execution Anomaly
 🟢    0.000          0      0/6000  PowerShell Download and Execution Cradles
 🟢    0.000          0      0/6000  Process Execution From A Potentially Suspicious Folder
 🟢    0.000          0      0/6000  Suspicious New Service Creation
 
-  🔴 0 red   🟡 1 yellow   🟢 4 green
-
-  Worst offenders (deploy these last, or not without tuning):
-    - Accessibility Tool Execution (osk/LogonUI/utilman family)
-        This rule matched confirmed-benign traffic in the baseline set -- do not
-        deploy without narrowing the selection before going live
+  🔴 0 red   🟡 0 yellow   🟢 5 green
 ```
 
-Rules that fail to parse or evaluate (e.g. use a Sigma modifier this
-evaluator doesn't support yet) are skipped with a reason shown at the end,
-rather than crashing the whole batch — verified by deliberately feeding it
-a rule with an unsupported modifier alongside 4 real SigmaHQ rules; the
-batch completed and flagged the one bad rule by name and error.
+Rules that fail to parse or evaluate are skipped with a reason shown at
+the end, rather than crashing the whole batch.
 
 ### Live SIEM connectors
 
@@ -135,7 +195,6 @@ batch completed and flagged the one bad rule by name and error.
 python -m src.cli --rule data/rules/test_accessibility_tools.yml --source splunk \
     --splunk-url https://localhost:8089 --splunk-user admin --splunk-pass '...' \
     --splunk-index main --lookback-hours 24
-# or with a static token instead of user/pass: --splunk-token '...'
 
 # Wazuh Indexer (OpenSearch) — normalization unit-tested, live calls unverified
 python -m src.cli --rule data/rules/test_accessibility_tools.yml --source wazuh \
@@ -151,137 +210,83 @@ python -m src.cli --rule data/rules/test_accessibility_tools.yml --source sentin
 
 ## What's proven, and how
 
-This section is deliberately specific about what was actually run vs. what
-was only unit-tested or designed but not yet exercised. No claim below is
-inferred — everything is a real, reproduced result.
-
 ### Core matcher & noise scorer
-- **Sigma modifiers**: `contains`/`startswith`/`endswith`/exact/numeric-equals/
-  keyword-search (original build), plus `re` (regex), `cidr`, `base64offset`,
-  and numeric comparisons `gt`/`gte`/`lt`/`lte` — all validated against
-  synthetic events built to isolate exactly one modifier each; each matched
-  precisely the events it should and rejected the rest. `base64offset`
-  specifically was confirmed to actually base64-decode and find a target
-  string inside an encoded command line, not just match by string luck.
-- **Deliberately noisy test rule** (`test_accessibility_tools.yml`, matches
-  `osk.exe`/`LogonUI.exe`/`sethc.exe`/`utilman.exe` — classic sticky-keys
-  backdoor detection, T1546.008) run against a real Sysmon capture from
-  [EVTX-ATTACK-SAMPLES](https://github.com/sbousseaden/EVTX-ATTACK-SAMPLES):
-  48/237 events matched, correctly scored **yellow**, 193 matches/day.
-- **Real SigmaHQ rule** (`susp_execution_path.yml`) run as a negative
-  control against the same data: **0 matches, green tier** — confirms the
-  tool doesn't just flag everything.
+- Sigma modifiers (`contains`/`startswith`/`endswith`/exact/numeric/`re`/`cidr`/
+  `base64offset`/`gt`/`gte`/`lt`/`lte`) validated against synthetic events
+  built to isolate each one.
+- **Logsource filtering validated against real data**: confirmed the
+  before/after match-count and baseline-rate change documented above by
+  direct inspection of which EventIDs contributed the excluded matches —
+  not inferred, directly checked record by record.
+- Real SigmaHQ rule used as a negative control: 0 matches, green tier.
 
-### Batch mode (ruleset triage)
-Ran `--rules-dir` against 5 real rules (the noisy test rule + 4 unmodified
-SigmaHQ rules covering whoami anomalies, PowerShell download cradles,
-suspicious execution paths, and suspicious service creation) with the
-baseline attached:
-- Correctly ranked the noisy test rule **first** (yellow, 48 matches, flagged
-  against the baseline) and all 4 real SigmaHQ rules green underneath it
-- Separately verified error handling: deliberately added a rule using an
-  unsupported Sigma modifier to the batch — it was skipped with its
-  filename and exact error shown at the end of the report, and the other
-  5 rules still scored correctly. One bad rule doesn't take down the batch.
-
-### Baseline false-positive checking
-- Pulled a real goodware baseline from
-  [NextronSystems/evtx-baseline](https://github.com/NextronSystems/evtx-baseline)
-  (the same dataset SigmaHQ itself uses for its own FP regression testing),
-  cached 6,000 parsed events to JSON.
-- The noisy test rule fired on **155/6,000 (2.58%)** of confirmed-benign
-  traffic — driven by `LogonUI.exe`, which legitimately runs on every
-  login. Real, corroborated evidence this rule needs tuning before
-  deployment, not an inference.
-- The control rule stayed green with zero false matches against the
-  baseline too.
+### Batch mode
+Ran `--rules-dir` against 5 real rules (1 custom + 4 unmodified SigmaHQ
+rules). After the logsource fix, all 5 score green against this
+particular capture and baseline — a materially different, and more
+accurate, picture than the pre-fix run. Error handling was separately
+verified: a rule with an unsupported modifier was skipped by filename and
+error without affecting the other 5.
 
 ### Live SIEM — Splunk (fully tested against real infrastructure)
-Set up a real Splunk Enterprise 10.2.2 instance (Windows) with Sysmon and
-the Splunk Windows TA feeding a live index, then ran the connector against
-it for real:
-
-1. `test_connection()` — auth + version check succeeded against the live
-   instance.
-2. First `fetch_events()` run came back with **every field null** across
-   all 5,000 events, despite the raw event clearly containing
-   `EventCode=5` and a populated `Image` field. Root cause: Splunk's REST
-   `/results` endpoint does **not** include every search-time-extracted
-   field by default — unlike Splunk Web's table view, which does
-   extraction on demand for display. This is a genuine, documented gotcha,
-   not a bug in our matcher.
-3. Fixed by explicitly forcing field selection with `| table <fields>` in
-   the SPL query (see `SplunkConnector._SELECT_FIELDS`).
-4. Triggered a real On-Screen Keyboard (`osk.exe`) execution on the test
-   machine, re-ran the full CLI end to end: **6 real matches**, correctly
-   scored yellow, correctly identified `logonui.exe` as 33% of the noise
-   and flagged the single-entity concentration for review.
-
-This is the strongest evidence in the project: real infra, a real bug
-found and fixed by reading the data rather than assuming the code was
-wrong, and a real detection of real activity on a real machine.
+Set up a real Splunk Enterprise 10.2.2 instance (Windows, Sysmon + Windows
+TA). First live fetch returned every field null despite the raw event
+containing them — root cause: Splunk's REST `/results` endpoint doesn't
+include every search-time-extracted field by default. Fixed with explicit
+`| table <fields>` in the SPL. After the fix, a real triggered `osk.exe`
+execution was detected end-to-end: 6 matches, live, on real infrastructure.
 
 ### Live SIEM — Wazuh & Sentinel (partially tested)
-`WazuhConnector._normalize()` and `SentinelConnector._normalize()` were
-unit-tested against realistic fake API response shapes (a Wazuh Sysmon
-alert document, a `DeviceProcessEvents` row) and confirmed to produce
-events that match correctly through the real Sigma evaluator. The actual
-`requests` calls to a live Wazuh Indexer or Sentinel Log Analytics
-workspace have **not** been executed. Given what the Splunk connector
-needed once it hit real data, assume something analogous — a field-mapping
-mismatch, an auth-flow edge case, a pagination limit — is waiting in each
-until proven otherwise.
+`_normalize()` methods unit-tested against realistic fake API response
+shapes and confirmed to produce events that match correctly. The actual
+live network calls have not been executed against real instances.
 
 ---
 
 ## Known limitations
 
-Stated plainly, not hidden, because an honest limitations section is more
-useful than a tool that quietly gets things wrong:
-
-- **Day-rate normalization assumes one coherent, continuously-captured
-  time window.** Feeding it several unrelated demo EVTX files stitched
-  from different scenarios dilutes the volume score toward green
-  regardless of real match density, because the gaps between unrelated
-  captures get counted as elapsed time. Point it at one real capture or a
-  live SIEM export covering one continuous window.
-- **The bundled baseline sample is only 6,000 of ~124MB available** in the
-  full NextronSystems dataset — `python-evtx` is pure Python and too slow
-  to parse the whole file in this environment in one pass. A larger or
-  incrementally-cached baseline would give a more reliable FP estimate.
-  `evtx_parser.load_events()` already supports reading back a cached JSON
-  sample so re-parsing cost isn't paid twice.
-- **`re`/`cidr`/`base64offset` modifiers are proven against synthetic test
-  cases, not yet against a real-world SigmaHQ rule using them.** Worth
-  doing before calling them fully battle-tested.
-- **`base64` (without offset), `fieldref`, and `cased` modifiers are not
-  implemented.**
-- **Wazuh and Sentinel connectors are unverified against live infra** (see
-  above) — treat as "should work, pending the same kind of debugging
-  Splunk needed" rather than "proven."
+- **Logsource filtering only covers Windows EventID-based categories.**
+  Non-Windows products (linux, aws, azure, etc.) and categories not in
+  `logsource_map.py`'s table are not filtered at all — this is a
+  deliberate fail-open design, not an oversight, but it does mean a rule
+  for an unmapped category gets zero benefit from this fix.
+- **The `service:` disambiguation (Sysmon vs. native Security log) is only
+  implemented for `process_creation`.** Other categories that could
+  plausibly come from either channel aren't narrowed further.
+- Day-rate normalization assumes one coherent, continuously-captured time
+  window.
+- The bundled baseline sample is 6,000 of ~124MB available in the full
+  NextronSystems dataset (parser speed constraint).
+- `re`/`cidr`/`base64offset` proven against synthetic cases, not yet
+  against a real SigmaHQ rule using them in combination with other logic.
+- `base64` (no offset), `fieldref`, `cased` modifiers not implemented.
+- Wazuh/Sentinel connectors unverified against live infra.
+- No automated regression test suite yet — validation has been empirical
+  (real runs against real/live data), not asserted in a committed `pytest`
+  suite that CI checks.
 
 ---
 
 ## Downloading sample data
 
-The packaged release strips `data/logs/*.evtx` to keep the download small.
-Re-fetch them from the same public dataset:
-
 ```bash
 cd data/logs
 curl -L "https://raw.githubusercontent.com/sbousseaden/EVTX-ATTACK-SAMPLES/master/Persistence/persistence_sysmon_11_13_1_shime_appfix.evtx" -o persistence_shim_appfix.evtx
-curl -L "https://raw.githubusercontent.com/sbousseaden/EVTX-ATTACK-SAMPLES/master/Privilege%20Escalation/privesc_unquoted_svc_sysmon_1_11.evtx" -o privesc_unquoted_svc.evtx
-curl -L "https://raw.githubusercontent.com/sbousseaden/EVTX-ATTACK-SAMPLES/master/Discovery/discovery_meterpreter_ps_cmd_process_listing_sysmon_10.evtx" -o discovery_meterpreter.evtx
-curl -L "https://raw.githubusercontent.com/sbousseaden/EVTX-ATTACK-SAMPLES/master/Discovery/discovery_bloodhound.evtx" -o discovery_bloodhound.evtx
-curl -L "https://raw.githubusercontent.com/sbousseaden/EVTX-ATTACK-SAMPLES/master/Discovery/4799_remote_local_groups_enumeration.evtx" -o discovery_4799_groups.evtx
 cd ../..
 ```
 
-On Windows PowerShell, use `Invoke-WebRequest -Uri ... -OutFile ...` if
-`curl.exe` isn't available.
-
-`data/baseline/sysmon_baseline_sample.json` (the goodware baseline) ships
-in the repo already — no download needed.
+The baseline (`data/baseline/sysmon_baseline_sample.json`) ships in the
+repo already. To regenerate it from the full dataset yourself:
+```bash
+curl -L "https://github.com/NextronSystems/evtx-baseline/releases/latest/download/win7-x86.tgz" -o /tmp/win7-x86.tgz
+tar xzf /tmp/win7-x86.tgz -C /tmp
+python -c "
+from src.evtx_parser import parse_evtx
+import json
+recs = parse_evtx('/tmp/win7-x86/Microsoft-Windows-Sysmon%4Operational.evtx', max_records=6000)
+json.dump(recs, open('data/baseline/sysmon_baseline_sample.json', 'w'))
+"
+```
 
 ---
 
@@ -290,15 +295,16 @@ in the repo already — no download needed.
 ```
 src/
   evtx_parser.py       -- EVTX -> normalized dict, + JSON cache load/save
-  sigma_eval.py         -- pySigma AST walker + matcher (all modifiers)
-  noise_score.py         -- scoring engine (volume/entity/temporal/noisy-pattern/baseline)
-  cli.py                 -- entry point, --rule / --rules-dir / --source dispatch
+  sigma_eval.py          -- pySigma AST walker + matcher + logsource pre-filter
+  logsource_map.py        -- Windows category -> EventID mapping (new)
+  noise_score.py            -- scoring engine (volume/entity/temporal/noisy-pattern/baseline)
+  cli.py                     -- entry point, --rule / --rules-dir / --source dispatch
   connectors/
-    base.py               -- SIEMConnector abstract interface
-    mock.py                 -- synthetic data connector (tested, works end to end)
-    splunk.py                -- Splunk REST API connector (LIVE-TESTED)
-    wazuh.py                  -- Wazuh Indexer/OpenSearch connector (unit-tested, live untested)
-    sentinel.py                -- Microsoft Sentinel/Log Analytics connector (unit-tested, live untested)
+    base.py                   -- SIEMConnector abstract interface
+    mock.py                     -- synthetic data connector (tested, works end to end)
+    splunk.py                    -- Splunk REST API connector (LIVE-TESTED)
+    wazuh.py                      -- Wazuh Indexer/OpenSearch connector (unit-tested, live untested)
+    sentinel.py                    -- Microsoft Sentinel/Log Analytics connector (unit-tested, live untested)
 data/
   logs/                 -- sample EVTX (sbousseaden/EVTX-ATTACK-SAMPLES; re-download, see above)
   rules/                 -- test rule + real SigmaHQ rules
@@ -310,11 +316,13 @@ data/
 
 ## Roadmap
 
-- [x] Batch mode (`--rules-dir`) — score an entire ruleset, ranked worst-to-best
+- [x] Batch mode (`--rules-dir`)
+- [x] Logsource-aware pre-filtering (v1.2)
+- [ ] Automated `pytest` regression suite, asserted in CI (not just smoke-tested)
 - [ ] Live-test the Wazuh and Sentinel connectors against real instances
 - [ ] Larger/incremental baseline dataset (full 124MB NextronSystems set)
 - [ ] Validate `re`/`cidr`/`base64offset` against a real SigmaHQ rule
 - [ ] `base64`, `fieldref`, `cased` modifier support
+- [ ] Secrets handling for live connectors (currently plaintext CLI args)
+- [ ] Pagination for live connectors beyond the current per-call cap
 - [ ] Optional: compile-to-query mode (SPL/KQL) for very large indexes
-      where pulling raw events isn't practical — a v3 optimization, not
-      needed at backtesting-sized time windows

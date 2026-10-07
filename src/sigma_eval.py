@@ -31,6 +31,7 @@ from sigma.conditions import (
     ConditionFieldEqualsValueExpression,
     ConditionValueExpression,
 )
+from src.logsource_map import event_matches_logsource, expected_event_ids
 
 
 def _glob_match(pattern: str, value: str) -> bool:
@@ -121,12 +122,28 @@ class CompiledSigmaRule:
         self.title = rule.title
         self.rule_id = str(rule.id) if rule.id else None
         self.level = str(rule.level) if rule.level else "unknown"
+        self.logsource = rule.logsource
         # A rule can have multiple conditions (multiple `condition:` entries);
         # match if ANY of them match (this is standard Sigma semantics).
         self._condition_trees = [c.parsed for c in rule.detection.parsed_condition]
 
     def matches(self, event: dict) -> bool:
         return any(_eval_node(tree, event) for tree in self._condition_trees)
+
+    def logsource_filter_status(self) -> str:
+        """Reports whether logsource-based pre-filtering is actually being
+        applied for this rule, so callers (the CLI, the noise scorer) can
+        be honest about it rather than silently filtering or silently not."""
+        expected = expected_event_ids(self.logsource)
+        if expected is None:
+            product = getattr(self.logsource, "product", None)
+            category = getattr(self.logsource, "category", None)
+            if not category:
+                return "no category in rule -- not filtered"
+            if product and str(product).lower() != "windows":
+                return f"product '{product}' not supported -- not filtered"
+            return f"category '{category}' not in mapping -- not filtered"
+        return f"filtered to EventID in {sorted(expected)}"
 
 
 def load_rule(path: str) -> CompiledSigmaRule:
@@ -138,7 +155,35 @@ def load_rule(path: str) -> CompiledSigmaRule:
 
 
 def run_rule_against_events(rule: CompiledSigmaRule, events: list[dict]) -> list[dict]:
-    return [e for e in events if rule.matches(e)]
+    """Matches a rule against events, pre-filtering by logsource first.
+
+    The logsource filter runs BEFORE field matching: an event whose
+    EventID doesn't belong to the rule's declared category (e.g. a
+    process_termination event reaching a process_creation rule) never
+    reaches the field matcher at all. This fixes a real false-match class
+    -- Sysmon logs fields like `Image` on multiple event types, so a
+    category-blind matcher can match a rule against the wrong kind of
+    event entirely. See logsource_map.py for what is and isn't covered;
+    an unmapped category means this filter does nothing for that rule
+    (fail open), which run_rule_against_events_detailed reports explicitly.
+    """
+    candidates = [e for e in events if event_matches_logsource(e, rule.logsource)]
+    return [e for e in candidates if rule.matches(e)]
+
+
+def run_rule_against_events_detailed(rule: CompiledSigmaRule, events: list[dict]) -> dict:
+    """Same as run_rule_against_events, but also reports how many events
+    were excluded by the logsource filter and whether the filter was even
+    applicable for this rule -- so a caller can show "N events scanned,
+    M excluded as wrong event type, X matched" instead of a bare count."""
+    candidates = [e for e in events if event_matches_logsource(e, rule.logsource)]
+    matches = [e for e in candidates if rule.matches(e)]
+    return {
+        "matches": matches,
+        "total_events": len(events),
+        "logsource_filtered_out": len(events) - len(candidates),
+        "logsource_status": rule.logsource_filter_status(),
+    }
 
 
 if __name__ == "__main__":

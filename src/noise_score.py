@@ -2,14 +2,13 @@
 Computes a tiered noise/false-positive-risk score for a Sigma rule based on
 its matches against a sample log set.
 
-Factors (see design discussion):
+Factors:
   1. Match volume, normalized by time span covered by the data
   2. Entity diversity (distinct hosts/users/processes / total matches)
   3. Temporal clustering (bursty vs evenly-spread-out matches)
   4. Known-noisy-pattern flag (matches cluster on common LOLBins/system procs)
-
-Output is a composite 0-1 score plus green/yellow/red tier, and the raw
-per-factor breakdown so the analyst can see WHY it's noisy, not just a number.
+  5. Baseline evidence, if a known-benign dataset is supplied -- dominates
+     the composite when present, since it's real evidence not inference.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -17,8 +16,6 @@ from datetime import datetime
 from collections import Counter
 import statistics
 
-# Binaries/parents that are known to fire "legitimately" a lot and are common
-# sources of noisy rules. Not exhaustive -- a starting seed list.
 KNOWN_NOISY_INDICATORS = {
     "svchost.exe", "logonui.exe", "consent.exe", "taskhostw.exe",
     "backgroundtaskhost.exe", "dllhost.exe", "conhost.exe", "wmiprvse.exe",
@@ -28,7 +25,6 @@ KNOWN_NOISY_INDICATORS = {
 ENTITY_FIELDS = ["Computer", "User", "TargetUserName", "SubjectUserName"]
 PROCESS_FIELDS = ["Image", "TargetImage", "NewProcessName"]
 
-# Tunable weights -- sum to 1.0 when no baseline is supplied.
 WEIGHTS = {
     "volume": 0.30,
     "entity_diversity": 0.25,
@@ -36,10 +32,6 @@ WEIGHTS = {
     "known_noisy": 0.25,
 }
 
-# When a benign baseline dataset IS supplied, its weight dominates the
-# composite -- a rule firing on confirmed-goodware traffic is much stronger
-# FP evidence than anything we can infer from attack-simulation data alone.
-# The other four factors get rescaled to make room for it.
 BASELINE_WEIGHT = 0.5
 
 
@@ -51,8 +43,8 @@ class NoiseReport:
     time_span_days: float
     matches_per_day: float
     distinct_entities: int
-    entity_concentration: float  # 0-1, high = few distinct actors (good)
-    temporal_spread_score: float  # 0-1, high = evenly spread (bad, background noise)
+    entity_concentration: float
+    temporal_spread_score: float
     known_noisy_hits: int
     known_noisy_ratio: float
     top_noisy_indicators: list
@@ -65,6 +57,8 @@ class NoiseReport:
     baseline_total_events: int = 0
     baseline_matches: int = 0
     baseline_match_rate: float = 0.0
+    logsource_status: str = ""
+    logsource_filtered_out: int = 0
 
 
 def _extract_timestamp(event: dict) -> datetime | None:
@@ -107,6 +101,8 @@ def compute_noise_score(
     matched_events: list[dict],
     baseline_total_events: int = 0,
     baseline_matched_events: list[dict] | None = None,
+    logsource_status: str = "",
+    logsource_filtered_out: int = 0,
 ) -> NoiseReport:
     total_matches = len(matched_events)
     total_scanned = len(all_events)
@@ -137,38 +133,28 @@ def compute_noise_score(
             baseline_total_events=baseline_total_events,
             baseline_matches=0,
             baseline_match_rate=0.0,
+            logsource_status=logsource_status,
+            logsource_filtered_out=logsource_filtered_out,
         )
 
-    # If the rule ONLY fired on baseline (benign) data and not on the
-    # attack-sim set, we still need the volume/entity/temporal factors --
-    # compute them off whichever event set actually has matches.
     scoring_events = matched_events if matched_events else (baseline_matched_events or [])
-
     scoring_count = len(scoring_events)
 
-    # --- 1. Volume, normalized by time span ---
     timestamps = sorted(t for t in (_extract_timestamp(e) for e in scoring_events) if t)
     if len(timestamps) >= 2:
         span_seconds = (timestamps[-1] - timestamps[0]).total_seconds()
-        time_span_days = max(span_seconds / 86400.0, 1.0 / 24.0)  # floor at 1hr to avoid div-by-tiny
+        time_span_days = max(span_seconds / 86400.0, 1.0 / 24.0)
     else:
         time_span_days = 1.0 / 24.0
     matches_per_day = scoring_count / time_span_days
-    # Normalize: 0 matches/day -> 0, 100+/day -> 1 (tunable ceiling)
     volume_score = _normalize(matches_per_day, 0, 100)
 
-    # --- 2. Entity diversity ---
     entities = [_extract_entity(e) for e in scoring_events]
     entities = [e for e in entities if e]
     entity_counts = Counter(entities)
     distinct_entities = len(entity_counts)
-    # concentration: 1.0 = all matches from one entity (low noise, easy to triage)
-    # 0.0 = every match a different entity (high noise, each needs individual review)
     entity_concentration = 1.0 - _normalize(distinct_entities, 1, scoring_count or 1)
 
-    # --- 3. Temporal clustering ---
-    # Coefficient of variation of inter-event gaps: low CoV = evenly spread
-    # (constant background noise, worse); high CoV = bursty (one incident, better)
     temporal_spread_score = 0.0
     if len(timestamps) >= 3:
         gaps = [
@@ -178,22 +164,16 @@ def compute_noise_score(
         gaps = [g for g in gaps if g >= 0]
         if gaps and statistics.mean(gaps) > 0:
             cov = (statistics.pstdev(gaps) / statistics.mean(gaps)) if len(gaps) > 1 else 0
-            # low CoV (evenly spaced) -> high spread score (worse)
             temporal_spread_score = _normalize(1.0 / (1.0 + cov), 0, 1)
 
-    # --- 4. Known-noisy-pattern flag ---
     processes = [_extract_process(e) for e in scoring_events]
     processes = [p for p in processes if p]
     noisy_hits = [p for p in processes if p in KNOWN_NOISY_INDICATORS]
     known_noisy_ratio = len(noisy_hits) / scoring_count if scoring_count else 0.0
     top_noisy = [item for item, _ in Counter(noisy_hits).most_common(5)]
 
-    # --- 5. Baseline (benign traffic) evidence, if supplied ---
-    # This is the strongest possible FP signal: the rule fired on data we
-    # KNOW is goodware, not just data adjacent to an attack simulation.
-    baseline_score = _normalize(baseline_match_rate, 0, 0.05)  # 5%+ hit rate on benign data = max noise
+    baseline_score = _normalize(baseline_match_rate, 0, 0.05)
 
-    # --- Composite ---
     if baseline_used:
         remaining = 1.0 - BASELINE_WEIGHT
         composite = (
@@ -272,4 +252,6 @@ def compute_noise_score(
         baseline_total_events=baseline_total_events,
         baseline_matches=baseline_matches,
         baseline_match_rate=round(baseline_match_rate, 5),
+        logsource_status=logsource_status,
+        logsource_filtered_out=logsource_filtered_out,
     )
